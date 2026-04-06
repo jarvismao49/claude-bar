@@ -31,9 +31,11 @@
       justify-content: space-between;
       align-items: center;
       margin-bottom: 12px;
+      padding: 8px 0;
+      border-bottom: 1px solid #333;
     }
     .toggle-row label { color: #ccc; font-size: 13px; margin: 0; }
-    .toggle { position: relative; width: 36px; height: 20px; }
+    .toggle { position: relative; width: 36px; height: 20px; flex-shrink: 0; margin-left: 12px; }
     .toggle input { opacity: 0; width: 0; height: 0; }
     .toggle .slider {
       position: absolute; cursor: pointer;
@@ -49,11 +51,43 @@
     }
     .toggle input:checked + .slider { background: #f0c040; }
     .toggle input:checked + .slider:before { transform: translateX(16px); }
-    .info { font-size: 12px; color: #666; margin-top: 16px; padding-top: 12px; border-top: 1px solid #333; }
+    .section-title { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; margin-top: 16px; }
+    .info { font-size: 11px; color: #555; margin-top: 16px; padding-top: 12px; border-top: 1px solid #2d2d2d; }
+    .local-costs {
+      background: #252525;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin-top: 8px;
+    }
+    .local-costs .label { font-size: 11px; color: #666; margin-bottom: 4px; }
+    .local-costs .value { font-size: 18px; color: #f0c040; font-weight: 600; }
+    .local-costs .sub { font-size: 11px; color: #666; margin-top: 2px; }
+    .btn-rescan {
+      width: 100%;
+      padding: 7px;
+      background: #2d2d2d;
+      color: #aaa;
+      border: 1px solid #444;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      margin-top: 8px;
+    }
+    .btn-rescan:hover { background: #333; color: #ccc; }
   </style>
 </head>
 <body>
   <h2>⚙  Settings</h2>
+
+  <div class="section-title">General</div>
+
+  <div class="toggle-row">
+    <label>Launch at login</label>
+    <label class="toggle">
+      <input type="checkbox" id="loginItemEnabled">
+      <span class="slider"></span>
+    </label>
+  </div>
 
   <div class="row">
     <label>Refresh Interval</label>
@@ -75,11 +109,21 @@
     </select>
   </div>
 
+  <div class="section-title">Local Cost (Claude Code sessions)</div>
+
+  <div class="local-costs">
+    <div class="label">This month</div>
+    <div class="value" id="localCostValue">—</div>
+    <div class="sub" id="localCostSub">Run Scan to detect</div>
+  </div>
+
+  <button class="btn-rescan" id="btnRescan">🔄 Scan Claude Code sessions</button>
+
   <div class="info">
     <strong>Data sources:</strong><br>
     Primary: OAuth API (reads <code>~/.claude/.credentials.json</code>)<br>
-    Fallback: <code>claude /usage</code> CLI output<br><br>
-    <strong>Token:</strong> Auto-read from Claude CLI on every poll.
+    Fallback: <code>claude /usage</code> CLI output<br>
+    Local: Scans <code>~/.config/claude/projects/**/*.jsonl</code>
   </div>
 
   <script>
@@ -87,16 +131,51 @@
       const s = await window.api.getSettings();
       document.getElementById('pollInterval').value = s.pollIntervalMs || 300000;
       document.getElementById('displayMode').value = s.displayMode || 'remaining';
+      document.getElementById('loginItemEnabled').checked = s.loginItemEnabled || false;
+
+      const costs = await window.api.getLocalCosts();
+      updateCostDisplay(costs);
     }
+
+    function updateCostDisplay(costs) {
+      if (!costs || !costs.totalTokens) {
+        document.getElementById('localCostValue').textContent = '—';
+        document.getElementById('localCostSub').textContent = 'No sessions found';
+        return;
+      }
+      const t = costs.totalTokens;
+      const fmt = t >= 1e9 ? (t/1e9).toFixed(2)+'B' : t >= 1e6 ? (t/1e6).toFixed(2)+'M' : t >= 1e3 ? (t/1e3).toFixed(1)+'K' : t;
+      document.getElementById('localCostValue').textContent = fmt + ' tokens';
+      const sessions = costs.sessionCount || 0;
+      const days = costs.days || 0;
+      document.getElementById('localCostSub').textContent = `${sessions} sessions over ${days} days`;
+    }
+
     document.getElementById('pollInterval').addEventListener('change', save);
     document.getElementById('displayMode').addEventListener('change', save);
+    document.getElementById('loginItemEnabled').addEventListener('change', save);
+
+    document.getElementById('btnRescan').addEventListener('click', async () => {
+      document.getElementById('btnRescan').textContent = '⏳ Scanning...';
+      document.getElementById('btnRescan').disabled = true;
+      try {
+        const costs = await window.api.rescanLocalCosts();
+        updateCostDisplay(costs);
+      } finally {
+        document.getElementById('btnRescan').textContent = '🔄 Scan Claude Code sessions';
+        document.getElementById('btnRescan').disabled = false;
+      }
+    });
+
     async function save() {
       const s = {
         pollIntervalMs: parseInt(document.getElementById('pollInterval').value, 10),
-        displayMode: document.getElementById('displayMode').value
+        displayMode: document.getElementById('displayMode').value,
+        loginItemEnabled: document.getElementById('loginItemEnabled').checked
       };
       await window.api.saveSettings(s);
     }
+
     init();
   </script>
 </body>

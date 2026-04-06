@@ -10,18 +10,18 @@
 
 ### P0-1: Token Refresh
 - [x] Read `~/.claude/.credentials.json` on every poll (like CodexBar)
-- [ ] Add refresh token support — POST to `/oauth/token` with `grant_type=refresh_token`
-- [ ] Detect 401 → attempt refresh → retry
+- [x] Add refresh token support — POST to `/oauth/token` with `grant_type=refresh_token`
+- [x] Detect 401 → attempt refresh → retry
 
 ### P0-2: CLI Fallback
-- [ ] When OAuth fails, spawn `claude /usage` via PTY (child_process with script trick)
-- [ ] Parse `/usage` output for session %, weekly %, reset time
-- [ ] Handle CLI not installed error gracefully
+- [x] When OAuth fails, spawn `claude /usage` via PTY (child_process with script trick)
+- [x] Parse `/usage` output for session %, weekly %, reset time
+- [x] Handle CLI not installed error gracefully
 
 ### P0-3: Pace Tracking
-- [ ] Calculate pace: (time_elapsed/window_duration) vs (usage_used/budget)
-- [ ] Show "on pace" / "X% deficit" / "X% reserve"
-- [ ] Show "runs out in Xh Ym" countdown when in deficit
+- [x] Calculate pace: (time_elapsed/window_duration) vs (usage_used/budget)
+- [x] Show "on pace" / "X% deficit" / "X% reserve"
+- [x] Show "runs out in Xh Ym" countdown when in deficit
 
 ---
 

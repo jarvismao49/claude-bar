@@ -3,6 +3,7 @@ const { app, Tray, Menu, nativeImage, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
+const os = require('os');
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Config & Persistence
@@ -14,7 +15,7 @@ fs.mkdirSync(CONFIG_DIR, { recursive: true });
 
 function loadSettings() {
   try { return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); }
-  catch { return { pollIntervalMs: 5 * 60 * 1000, displayMode: 'remaining' }; }
+  catch { return { pollIntervalMs: 5 * 60 * 1000, displayMode: 'remaining', loginItemEnabled: false }; }
 }
 function saveSettings(s) {
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2));
@@ -248,6 +249,7 @@ let lastError       = null;
 let settingsWin     = null;
 
 let pollIntervalMs = loadSettings().pollIntervalMs || 5 * 60 * 1000;
+const LOGIN_ITEM_ENABLED = loadSettings().loginItemEnabled || false;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Icon
@@ -472,10 +474,28 @@ ipcMain.handle('get-settings', () => loadSettings());
 ipcMain.handle('save-settings', (_, s) => {
   saveSettings(s);
   pollIntervalMs = s.pollIntervalMs || 5 * 60 * 1000;
+
+  // Update login item (only works in packaged app, silently fails in dev)
+  try {
+    if (app.isPackaged) {
+      app.setLoginItemSettings({
+        openAtLogin: !!s.loginItemEnabled,
+        path: process.execPath,
+        args: []
+      });
+    }
+  } catch {}
+
   startPolling();
   return loadSettings();
 });
 ipcMain.handle('get-data', () => ({ cachedData, lastRefresh, lastError }));
+ipcMain.handle('get-local-costs', () => loadCachedCosts());
+ipcMain.handle('rescan-local-costs', () => {
+  const costs = scanLocalCosts();
+  saveCachedCosts(costs);
+  return costs;
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Polling
@@ -487,8 +507,132 @@ function startPolling() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  Local Cost Scanning — parses Claude Code session jsonl files
+// ═══════════════════════════════════════════════════════════════════════════════
+const LOCAL_COST_CACHE = path.join(CONFIG_DIR, 'local_costs.json');
+
+function loadCachedCosts() {
+  try {
+    const d = JSON.parse(fs.readFileSync(LOCAL_COST_CACHE, 'utf8'));
+    // Only use cache if it's from today
+    if (d.date === new Date().toISOString().split('T')[0]) return d;
+  } catch {}
+  return null;
+}
+
+function saveCachedCosts(costs) {
+  fs.writeFileSync(LOCAL_COST_CACHE, JSON.stringify({ ...costs, date: new Date().toISOString().split('T')[0] }, null, 2));
+}
+
+function scanLocalCosts() {
+  const projectRoots = [
+    path.join(process.env.HOME, '.config', 'claude', 'projects'),
+    path.join(process.env.HOME, '.claude', 'projects')
+  ];
+
+  const seen = new Set(); // deduplicate by message.id + requestId
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let totalCacheRead = 0;
+  let totalCacheCreate = 0;
+  let sessionCount = 0;
+  let oldestDate = null;
+  let newestDate = null;
+
+  const now = new Date();
+  const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+  for (const root of projectRoots) {
+    if (!fs.existsSync(root)) continue;
+
+    const projects = fs.readdirSync(root).filter(p => fs.statSync(path.join(root, p)).isDirectory());
+
+    for (const project of projects.slice(0, 20)) { // cap at 20 projects
+      const projectDir = path.join(root, project);
+
+      // Find all .jsonl files
+      function walkDir(dir) {
+        try {
+          for (const entry of fs.readdirSync(dir)) {
+            const full = path.join(dir, entry);
+            const stat = fs.statSync(full);
+            if (stat.isDirectory()) {
+              walkDir(full);
+            } else if (entry.endsWith('.jsonl') && stat.mtime > thirtyDaysAgo) {
+              parseJsonl(full);
+            }
+          }
+        } catch { /* skip inaccessible dirs */ }
+      }
+
+      walkDir(projectDir);
+    }
+  }
+
+  function parseJsonl(filePath) {
+    try {
+      const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim());
+      let lastId = null;
+      let lastReqId = null;
+
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line);
+          // Only count assistant messages with usage
+          if (entry.type !== 'assistant' && entry.type !== 'result') continue;
+          const usage = entry.message?.usage || entry.usage;
+          if (!usage) continue;
+
+          // Deduplicate streaming chunks — same message.id + requestId = one usage
+          const msgId = entry.message?.id || entry.id;
+          const reqId = entry.requestId || entry.request_id || null;
+          const dedupKey = `${msgId}:${reqId}`;
+          if (dedupKey !== `${lastId}:${lastReqId}`) {
+            // New unique message
+            if (msgId && msgId !== lastId) sessionCount++;
+            lastId = msgId;
+            lastReqId = reqId;
+          }
+          if (seen.has(dedupKey)) continue;
+          seen.add(dedupKey);
+
+          totalInputTokens   += usage.input_tokens || 0;
+          totalOutputTokens  += usage.output_tokens || 0;
+          totalCacheRead     += usage.cache_read_tokens || 0;
+          totalCacheCreate   += usage.cache_creation_tokens || 0;
+        } catch { /* skip malformed lines */ }
+      }
+    } catch { /* skip unreadable files */ }
+  }
+
+  return {
+    totalTokens: totalInputTokens + totalOutputTokens,
+    inputTokens: totalInputTokens,
+    outputTokens: totalOutputTokens,
+    cacheReadTokens: totalCacheRead,
+    cacheCreationTokens: totalCacheCreate,
+    sessionCount,
+    days: 30
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  Bootstrap
 // ═══════════════════════════════════════════════════════════════════════════════
-app.whenReady().then(() => { createTray(); });
+app.whenReady().then(() => {
+  // Apply saved login item setting on startup
+  const settings = loadSettings();
+  try {
+    if (app.isPackaged) {
+      app.setLoginItemSettings({
+        openAtLogin: !!settings.loginItemEnabled,
+        path: process.execPath,
+        args: []
+      });
+    }
+  } catch {}
+
+  createTray();
+});
 app.on('window-all-closed', () => { /* stay in tray */ });
 app.on('activate', () => { /* macOS dock */ });
