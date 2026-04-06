@@ -74,6 +74,17 @@
       margin-top: 8px;
     }
     .btn-rescan:hover { background: #333; color: #ccc; }
+    .history-section { margin-top: 20px; }
+    .history-title { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+    .history-chart { display: flex; align-items: flex-end; gap: 2px; height: 50px; margin: 8px 0; }
+    .history-bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; gap: 2px; }
+    .history-bar { width: 100%; background: #f0c040; border-radius: 2px 2px 0 0; min-height: 2px; transition: height 0.3s; }
+    .history-bar-label { font-size: 9px; color: #555; text-align: center; }
+    .history-empty { font-size: 12px; color: #555; text-align: center; padding: 16px 0; }
+    .history-summary { display: flex; gap: 16px; margin-top: 8px; }
+    .history-summary-item { flex: 1; background: #252525; border-radius: 6px; padding: 8px 10px; }
+    .history-summary-item .label { font-size: 10px; color: #666; }
+    .history-summary-item .value { font-size: 14px; color: #e0e0e0; font-weight: 600; margin-top: 2px; }
   </style>
 </head>
 <body>
@@ -119,6 +130,14 @@
 
   <button class="btn-rescan" id="btnRescan">🔄 Scan Claude Code sessions</button>
 
+  <div class="history-section">
+    <div class="history-title">30-Day Trend (Session %)</div>
+    <div class="history-chart" id="historyChart">
+      <div class="history-empty" id="historyEmpty">No history yet — data populates after each refresh</div>
+    </div>
+    <div class="history-summary" id="historySummary"></div>
+  </div>
+
   <div class="info">
     <strong>Data sources:</strong><br>
     Primary: OAuth API (reads <code>~/.claude/.credentials.json</code>)<br>
@@ -135,6 +154,8 @@
 
       const costs = await window.api.getLocalCosts();
       updateCostDisplay(costs);
+
+      loadHistory();
     }
 
     function updateCostDisplay(costs) {
@@ -149,6 +170,42 @@
       const sessions = costs.sessionCount || 0;
       const days = costs.days || 0;
       document.getElementById('localCostSub').textContent = `${sessions} sessions over ${days} days`;
+    }
+
+    async function loadHistory() {
+      const history = await window.api.getHistory();
+      const chart = document.getElementById('historyChart');
+      const summary = document.getElementById('historySummary');
+
+      if (!history || history.length === 0) {
+        chart.innerHTML = '<div class="history-empty">No history yet — data populates after each refresh</div>';
+        return;
+      }
+
+      // Show last 14 days
+      const last14 = history.slice(-14);
+      const maxPct = Math.max(...last14.map(d => d.sessionPct || 0), 1);
+
+      chart.innerHTML = last14.map(d => {
+        const h = d.sessionPct != null ? Math.max(Math.round((d.sessionPct / maxPct) * 48), 2) : 2;
+        const label = d.date ? d.date.slice(5) : ''; // MM-DD
+        const tooltip = d.sessionPct != null ? Math.round(d.sessionPct) + '%' : '—';
+        return `<div class="history-bar-wrap">
+          <div class="history-bar" style="height:${h}px" title="${tooltip}"></div>
+          <div class="history-bar-label">${label}</div>
+        </div>`;
+      }).join('');
+
+      // Summary stats
+      const pcts = last14.map(d => d.sessionPct).filter(p => p != null);
+      const avg = pcts.length ? Math.round(pcts.reduce((a,b) => a+b, 0) / pcts.length) : null;
+      const high = pcts.length ? Math.round(Math.max(...pcts)) : null;
+      const low = pcts.length ? Math.round(Math.min(...pcts)) : null;
+      summary.innerHTML = `
+        <div class="history-summary-item"><div class="label">Avg</div><div class="value">${avg != null ? avg+'%' : '—'}</div></div>
+        <div class="history-summary-item"><div class="label">Peak</div><div class="value">${high != null ? high+'%' : '—'}</div></div>
+        <div class="history-summary-item"><div class="label">Low</div><div class="value">${low != null ? low+'%' : '—'}</div></div>
+      `;
     }
 
     document.getElementById('pollInterval').addEventListener('change', save);

@@ -279,6 +279,14 @@ function fmtPct(n) {
   return n != null ? `${Math.round(n)}%` : '—';
 }
 
+function fmtTokenCount(n) {
+  if (n == null) return '—';
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
 function fmtReset(resetText) {
   if (!resetText) return '';
   return ` (resets ${resetText})`;
@@ -336,6 +344,9 @@ function buildMenu() {
       { label: sessionLabel, enabled: false },
       { label: weeklyLabel, enabled: false },
       ...(extraRow ? [{ label: extraRow, enabled: false }] : []),
+    ...(cachedData?.localCosts ? [
+      { label: `Local     ${fmtTokenCount(cachedData.localCosts.totalTokens)} tokens (${cachedData.localCosts.sessionCount} sessions)`, enabled: false }
+    ] : []),
       { type: 'separator' },
     ] : [
       { label: '⚠️  Not logged in', enabled: false },
@@ -399,6 +410,7 @@ async function doRefresh() {
           cachedData = parsed;
           lastRefresh = new Date().toLocaleTimeString();
           lastError = null;
+          recordSnapshot(parsed);
         } else {
           throw new Error(parsed.error);
         }
@@ -496,6 +508,7 @@ ipcMain.handle('rescan-local-costs', () => {
   saveCachedCosts(costs);
   return costs;
 });
+ipcMain.handle('get-history', () => loadHistory());
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Polling
@@ -617,6 +630,73 @@ function scanLocalCosts() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  Cost History — daily snapshots
+// ═══════════════════════════════════════════════════════════════════════════════
+const HISTORY_FILE = path.join(CONFIG_DIR, 'history.json');
+
+function loadHistory() {
+  try {
+    const h = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+    return Array.isArray(h) ? h : [];
+  } catch { return []; }
+}
+
+function saveHistory(h) {
+  // Keep last 90 days
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 90);
+  const filtered = h.filter(e => new Date(e.date) >= cutoff);
+  fs.writeFileSync(HISTORY_FILE, JSON.stringify(filtered, null, 2));
+}
+
+function recordSnapshot(data) {
+  if (!data) return;
+  const today = new Date().toISOString().split('T')[0];
+  const history = loadHistory();
+
+  // Update or append today's snapshot
+  const existing = history.findIndex(e => e.date === today);
+  const snapshot = {
+    date: today,
+    sessionPct: data.session?.utilization ?? null,
+    weeklyPct: data.weekly?.utilization ?? null,
+    extraUsed: data.extra?.used ?? null,
+    extraLimit: data.extra?.limit ?? null
+  };
+
+  if (existing >= 0) {
+    history[existing] = { ...history[existing], ...snapshot };
+  } else {
+    history.push(snapshot);
+  }
+
+  saveHistory(history);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Auto-Update Checker — lightweight, no signing required
+// ═══════════════════════════════════════════════════════════════════════════════
+let updateAvailable = null;
+
+async function checkForUpdate() {
+  try {
+    const res = await fetch('https://api.github.com/repos/jarvismao49/claude-bar/releases/latest', {
+      headers: { 'Accept': 'application/vnd.github.v3+json' }
+    });
+    if (!res.ok) return;
+    const release = await res.json();
+    const latest = release.tag_name?.replace(/^v/, '') || release.name?.replace(/^v/, '');
+    const current = app.getVersion();
+
+    if (latest && latest !== current) {
+      updateAvailable = { version: latest, url: release.html_url };
+      // Notify via menu
+      refreshTray();
+    }
+  } catch {}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  Bootstrap
 // ═══════════════════════════════════════════════════════════════════════════════
 app.whenReady().then(() => {
@@ -632,7 +712,18 @@ app.whenReady().then(() => {
     }
   } catch {}
 
+  // Load cached local costs on startup (fast, no scan)
+  const cachedCosts = loadCachedCosts();
+  if (cachedCosts) {
+    cachedData = { localCosts: cachedCosts };
+  }
+
   createTray();
+
+  // Check for updates on startup (packaged app only)
+  if (app.isPackaged) {
+    setTimeout(checkForUpdate, 3000);
+  }
 });
 app.on('window-all-closed', () => { /* stay in tray */ });
 app.on('activate', () => { /* macOS dock */ });

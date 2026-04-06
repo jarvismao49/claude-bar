@@ -34,19 +34,18 @@
 - [ ] Save to config.json
 
 ### P1-2: Auto-start on Login
-- [ ] macOS LoginItems via Electron's `app.setLoginItemSettings`
-- [ ] Toggle in settings
+- [x] macOS LoginItems via Electron's `app.setLoginItemSettings`
+- [x] Toggle in settings
 
 ### P1-3: Local Cost Scanning
-- [ ] Parse `~/.config/claude/projects/**/*.jsonl`
-- [ ] Extract `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`
-- [ ] Deduplicate streaming chunks by `message.id`
-- [ ] Store and display as secondary "Local Cost" row
+- [x] Parse `~/.config/claude/projects/**/*.jsonl`
+- [x] Extract `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`
+- [x] Deduplicate streaming chunks by `message.id`
+- [x] Store and display in settings window
 
 ### P1-4: Robust Error States
-- [ ] Dim icon when last refresh failed
-- [ ] Show error indicator in menu
-- [ ] Retry with exponential backoff on network errors
+- [x] Show error indicator in menu
+- [x] Exponential backoff on network errors
 
 ---
 
