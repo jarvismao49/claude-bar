@@ -1,0 +1,26 @@
+{
+  "name": "usage-tracker",
+  "version": "1.0.0",
+  "description": "Menu bar token usage tracker for Claude",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --dir",
+    "package": "electron-builder --dir"
+  },
+  "author": "Henry",
+  "license": "MIT",
+  "productName": "ClaudeBar",
+  "build": {
+    "mac": {
+      "target": "dir",
+      "icon": "src/icon.png"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^26.8.1",
+    "typescript": "^5.7.3"
+  }
+}

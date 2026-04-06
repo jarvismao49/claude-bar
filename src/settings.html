@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Settings</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #1e1e1e;
+      color: #e0e0e0;
+      padding: 20px;
+      font-size: 14px;
+    }
+    h2 { font-size: 15px; font-weight: 600; margin-bottom: 16px; color: #f0c040; }
+    .row { margin-bottom: 12px; }
+    label { display: block; font-size: 12px; color: #888; margin-bottom: 4px; }
+    input {
+      width: 100%;
+      padding: 8px 10px;
+      background: #2d2d2d;
+      border: 1px solid #444;
+      border-radius: 6px;
+      color: #e0e0e0;
+      font-size: 13px;
+    }
+    input:focus { outline: none; border-color: #f0c040; }
+    input[type="password"] { font-family: monospace; }
+    .hint { font-size: 11px; color: #666; margin-top: 3px; }
+    .btn-row { display: flex; gap: 8px; margin-top: 16px; }
+    button {
+      flex: 1;
+      padding: 8px;
+      border-radius: 6px;
+      border: none;
+      font-size: 13px;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    .btn-save { background: #f0c040; color: #1e1e1e; }
+    .btn-cancel { background: #2d2d2d; color: #aaa; border: 1px solid #444; }
+    .msg { font-size: 12px; margin-top: 10px; text-align: center; }
+    .msg.ok { color: #4caf50; }
+    .msg.err { color: #f44336; }
+    .section { font-size: 12px; color: #666; margin-top: 14px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+  </style>
+</head>
+<body>
+  <h2>⚙ Settings</h2>
+
+  <div class="section">API Keys</div>
+
+  <div class="row">
+    <label>Anthropic Admin API Key (sk-ant-admin...)</label>
+    <input type="password" id="anthropicAdminKey" placeholder="sk-ant-admin...">
+  </div>
+
+  <div class="row">
+    <label>OpenAI API Key (sk-...)</label>
+    <input type="password" id="openaiKey" placeholder="sk-... (TODO)">
+  </div>
+
+  <div class="row">
+    <label>MiniMax API Key</label>
+    <input type="password" id="minimaxKey" placeholder="TODO">
+  </div>
+
+  <div class="section">Prices (per 1M tokens)</div>
+
+  <div class="row">
+    <label>Anthropic</label>
+    <input type="number" id="anthropicPrice" value="3.00" step="0.01" min="0">
+  </div>
+
+  <div class="row">
+    <label>OpenAI</label>
+    <input type="number" id="openaiPrice" value="2.50" step="0.01" min="0">
+  </div>
+
+  <div class="row">
+    <label>MiniMax</label>
+    <input type="number" id="minimaxPrice" value="0.20" step="0.01" min="0">
+  </div>
+
+  <div class="btn-row">
+    <button class="btn-cancel" onclick="window.close()">Cancel</button>
+    <button class="btn-save" onclick="save()">Save</button>
+  </div>
+  <div class="msg" id="msg"></div>
+
+  <script>
+    async function init() {
+      const cfg = await window.api.getConfig();
+      document.getElementById('anthropicAdminKey').value = cfg.anthropicAdminKey || '';
+      document.getElementById('openaiKey').value = cfg.openaiKey || '';
+      document.getElementById('minimaxKey').value = cfg.minimaxKey || '';
+      document.getElementById('anthropicPrice').value = cfg.pricePer1M?.anthropic || 3.0;
+      document.getElementById('openaiPrice').value = cfg.pricePer1M?.openai || 2.5;
+      document.getElementById('minimaxPrice').value = cfg.pricePer1M?.minimax || 0.2;
+    }
+
+    async function save() {
+      const cfg = {
+        anthropicAdminKey: document.getElementById('anthropicAdminKey').value.trim(),
+        openaiKey: document.getElementById('openaiKey').value.trim(),
+        minimaxKey: document.getElementById('minimaxKey').value.trim(),
+        pollIntervalMs: 10 * 60 * 1000,
+        pricePer1M: {
+          anthropic: parseFloat(document.getElementById('anthropicPrice').value) || 3.0,
+          openai: parseFloat(document.getElementById('openaiPrice').value) || 2.5,
+          minimax: parseFloat(document.getElementById('minimaxPrice').value) || 0.2
+        }
+      };
+      try {
+        await window.api.saveConfig(cfg);
+        document.getElementById('msg').className = 'msg ok';
+        document.getElementById('msg').textContent = 'Settings saved!';
+        setTimeout(() => window.close(), 800);
+      } catch (e) {
+        document.getElementById('msg').className = 'msg err';
+        document.getElementById('msg').textContent = 'Error: ' + e.message;
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>
