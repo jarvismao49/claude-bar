@@ -1,5 +1,5 @@
 'use strict';
-const { app, Tray, Menu, nativeImage, ipcMain } = require('electron');
+const { app, Tray, Menu, nativeImage, ipcMain, globalShortcut } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
@@ -254,22 +254,159 @@ const LOGIN_ITEM_ENABLED = loadSettings().loginItemEnabled || false;
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Icon
 // ═══════════════════════════════════════════════════════════════════════════════
+// ── Dynamic tray icon — colored circle with % text, generated as PNG ──────────
+//
+//  Icon states:
+//   grey     = error / no data
+//   red      = ≥90% session used (critical)
+//   orange   = 75–89% (warning)
+//   yellow   = 50–74% (moderate)
+//   green    = <50% (healthy)
+
+const ICON_SIZE = 18;
+
+// Parse a hex color like '#ff3b30' → [r, g, b]
+function hexToRgb(hex) {
+  const n = parseInt(hex.replace('#', ''), 16);
+  return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+}
+
+// Build a PNG data URL for a solid-color circle + ⚡ symbol
+function buildIconPng(hexColor) {
+  const SIZE = ICON_SIZE;
+  const [r, g, b] = hexToRgb(hexColor);
+
+  // Pixel buffer: each pixel = RGBA (4 bytes), row padded to 4 bytes (stride)
+  const stride = Math.ceil(SIZE * 4 / 4) * 4; // = 72 bytes for 18px
+  const raw = Buffer.alloc(stride * SIZE);    // raw pixel rows (no filter)
+
+  const cx = SIZE / 2, cy = SIZE / 2;
+  const radius = 7.5;
+
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const idx = y * stride + x * 4;
+      const dx = x - cx, dy = y - cy;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      if (dist <= radius) {
+        // Filled circle in the given color
+        raw[idx]   = r;
+        raw[idx+1] = g;
+        raw[idx+2] = b;
+        raw[idx+3] = 255;
+      } else if (dist <= radius + 1.0) {
+        // Anti-aliased edge — fade to transparent
+        const alpha = Math.max(0, Math.round(255 * (radius + 1 - dist)));
+        raw[idx]   = r;
+        raw[idx+1] = g;
+        raw[idx+2] = b;
+        raw[idx+3] = alpha;
+      } else {
+        // Transparent
+        raw[idx] = raw[idx+1] = raw[idx+2] = raw[idx+3] = 0;
+      }
+    }
+  }
+
+  // Draw ⚡ symbol as small yellow rectangle in center
+  // Bolt: 4px wide, 8px tall, centered
+  const bx1 = Math.floor(SIZE / 2) - 2, bx2 = bx1 + 4;
+  const by1 = Math.floor(SIZE / 2) - 4, by2 = by1 + 8;
+  for (let y = by1; y < by2; y++) {
+    for (let x = bx1; x < bx2; x++) {
+      if (y >= 0 && y < SIZE && x >= 0 && x < SIZE) {
+        const idx = y * stride + x * 4;
+        raw[idx]   = 255;
+        raw[idx+1] = 220;
+        raw[idx+2] = 0;
+        raw[idx+3] = 220;
+      }
+    }
+  }
+
+  // Add filter byte (0 = None) at start of each row → idatRaw
+  const idatRaw = Buffer.alloc(stride * SIZE + SIZE);
+  for (let y = 0; y < SIZE; y++) {
+    idatRaw[y * (stride + 1)] = 0; // filter type None
+    raw.copy(idatRaw, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
+  }
+
+  const zlib = require('zlib');
+  const compressed = zlib.deflateSync(idatRaw, { level: 6 });
+
+  // Build PNG: signature + IHDR + IDAT + IEND
+  function chunk(type, data) {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const typeAndData = Buffer.concat([Buffer.from(type), data]);
+    const crc = crc32(typeAndData);
+    const crcBuf = Buffer.alloc(4);
+    crcBuf.writeUInt32BE(crc >>> 0);
+    return Buffer.concat([len, typeAndData, crcBuf]);
+  }
+
+  // CRC32 lookup table
+  const crcTable = (function() {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c;
+    }
+    return t;
+  })();
+
+  function crc32(buf) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) crc = crcTable[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+    return crc ^ 0xffffffff;
+  }
+
+  const sig    = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const ihdr   = chunk('IHDR', Buffer.from([
+    (SIZE >> 24) & 0xff, (SIZE >> 16) & 0xff, (SIZE >> 8) & 0xff, SIZE & 0xff,
+    (SIZE >> 24) & 0xff, (SIZE >> 16) & 0xff, (SIZE >> 8) & 0xff, SIZE & 0xff,
+    8,  // bit depth
+    6,  // color type: RGBA
+    0,  // compression
+    0,  // filter
+    0   // interlace
+  ]));
+  const idatChunk = chunk('IDAT', compressed);
+  const iend     = chunk('IEND', Buffer.alloc(0));
+
+  const png = Buffer.concat([sig, ihdr, idatChunk, iend]);
+  return `data:image/png;base64,${png.toString('base64')}`;
+}
+
+// Color map — keyed by state
+const ICON_COLORS = {
+  error:     '#888888',
+  critical:  '#ff3b30',
+  warning:   '#ff9500',
+  moderate:  '#ffcc00',
+  healthy:   '#34c759'
+};
+
+// LRU cache for generated icons
+const iconCache = {};
+
+function getIconColor(pct, hasError) {
+  if (hasError) return 'error';
+  if (pct == null) return 'healthy';
+  if (pct >= 90) return 'critical';
+  if (pct >= 75) return 'warning';
+  if (pct >= 50) return 'moderate';
+  return 'healthy';
+}
+
 function makeIcon(utilization, hasError) {
-  // Reads icon.png (18x18 PNG from disk)
-  const iconPath = path.join(__dirname, 'icon.png');
-  let img = nativeImage.createFromPath(iconPath);
-
-  if (img.isEmpty()) {
-    // Fallback: transparent 18x18
-    img = nativeImage.createEmpty();
+  const key = getIconColor(utilization, hasError);
+  if (!iconCache[key]) {
+    iconCache[key] = nativeImage.createFromDataURL(buildIconPng(ICON_COLORS[key]));
   }
-
-  // Dim the icon if there's an error (template image mode)
-  if (hasError) {
-    img = img.isTemplate ? img : img;
-  }
-
-  return img;
+  return iconCache[key];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -380,10 +517,23 @@ function createTray() {
 function refreshTray() {
   if (!tray) return;
   const pct = cachedData?.session?.utilization;
-  const tip = lastError
-    ? `⚠️ ${lastError.slice(0, 40)}`
-    : (pct != null ? `ClaudeBar — ${Math.round(pct)}%` : 'ClaudeBar');
+  const weeklyPct = cachedData?.weekly?.utilization;
+  const localTokens = cachedData?.localCosts?.totalTokens;
+  const hasError = !!lastError;
+
+  // Build richer tooltip
+  let tip = hasError
+    ? `⚠️ ${lastError.slice(0, 50)}`
+    : 'ClaudeBar';
+  if (pct != null) tip += ` | Session ${Math.round(pct)}%`;
+  if (weeklyPct != null) tip += ` | Week ${Math.round(weeklyPct)}%`;
+  if (localTokens != null) {
+    const fmt = localTokens >= 1e6 ? (localTokens/1e6).toFixed(1)+'M' : localTokens >= 1e3 ? (localTokens/1e3).toFixed(0)+'K' : String(localTokens);
+    tip += ` | Local ${fmt} tok`;
+  }
+
   tray.setToolTip(tip);
+  tray.setImage(makeIcon(pct, hasError));
   tray.setContextMenu(buildMenu());
 }
 
@@ -398,6 +548,7 @@ async function doRefresh() {
     cachedData = await fetchUsageOAuth();
     lastRefresh = new Date().toLocaleTimeString();
     lastError = null;
+    recordSnapshot(cachedData); // always record on successful poll
   } catch (e) {
     const oauthFailed = e.message;
 
@@ -724,6 +875,20 @@ app.whenReady().then(() => {
   if (app.isPackaged) {
     setTimeout(checkForUpdate, 3000);
   }
+
+  // Register global shortcut: Cmd+Shift+R to refresh
+  const shortcut = 'CommandOrControl+Shift+R';
+  const registered = globalShortcut.register(shortcut, () => {
+    if (tray) doRefresh();
+  });
+  if (!registered) {
+    console.log('[ClaudeBar] Global shortcut registration failed:', shortcut);
+  } else {
+    console.log('[ClaudeBar] Global shortcut registered:', shortcut);
+  }
 });
 app.on('window-all-closed', () => { /* stay in tray */ });
 app.on('activate', () => { /* macOS dock */ });
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll();
+});
