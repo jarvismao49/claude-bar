@@ -1,40 +1,65 @@
-const { app, Tray, Menu, nativeImage, shell, ipcMain } = require('electron');
+'use strict';
+const { app, Tray, Menu, nativeImage, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 
-// ── Config & Data ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Config & Persistence
+// ═══════════════════════════════════════════════════════════════════════════════
 const CONFIG_DIR = path.join(process.env.HOME, '.config', 'usage-tracker');
-const CRED_FILE = path.join(CONFIG_DIR, 'claude_token.json');
+const CRED_FILE  = path.join(CONFIG_DIR, 'claude_token.json');
+const SETTINGS_FILE = path.join(CONFIG_DIR, 'settings.json');
 fs.mkdirSync(CONFIG_DIR, { recursive: true });
 
-function loadToken() {
+function loadSettings() {
+  try { return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); }
+  catch { return { pollIntervalMs: 5 * 60 * 1000, displayMode: 'remaining' }; }
+}
+function saveSettings(s) {
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2));
+}
+
+function loadStoredToken() {
   try { return JSON.parse(fs.readFileSync(CRED_FILE, 'utf8')); }
   catch { return null; }
 }
-function saveToken(t) {
+function saveStoredToken(t) {
   fs.writeFileSync(CRED_FILE, JSON.stringify(t, null, 2));
 }
-function loadDisabled() {
-  return loadToken()?.disabled || false;
-}
 
-// ── Claude OAuth (usage API) ───────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Claude Token — reads from CLI credentials (like CodexBar)
+//  This is the primary source: the CLI handles OAuth refresh internally.
+// ═══════════════════════════════════════════════════════════════════════════════
+const CLI_CRED_FILE = path.join(process.env.HOME, '.claude', '.credentials.json');
+
 function getClaudeToken() {
-  const stored = loadToken();
+  const stored = loadStoredToken();
   if (stored?.accessToken && stored?.expiresAt > Date.now()) {
     return stored.accessToken;
   }
-  if (storeDisabled) return null;
+  // Always read fresh from CLI credentials file
   try {
-    const cred = JSON.parse(fs.readFileSync(path.join(process.env.HOME, '.claude', '.credentials.json'), 'utf8'));
-    return cred?.claudeAiOauth?.accessToken || null;
-  } catch { return null; }
+    const cred = JSON.parse(fs.readFileSync(CLI_CRED_FILE, 'utf8'));
+    const token = cred?.claudeAiOauth?.accessToken;
+    if (token) {
+      // Refresh stored copy
+      if (stored?.accessToken !== token) {
+        saveStoredToken({ accessToken: token, expiresAt: Date.now() + 30 * 60 * 1000 });
+      }
+      return token;
+    }
+  } catch {}
+  return null;
 }
 
-async function fetchClaudeUsage() {
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Usage API — primary data source via OAuth
+// ═══════════════════════════════════════════════════════════════════════════════
+async function fetchUsageOAuth() {
   const token = getClaudeToken();
-  if (!token) throw new Error('Not logged in — click Login.');
+  if (!token) throw new Error('Not logged in — run Login.');
 
   const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
     headers: {
@@ -43,231 +68,427 @@ async function fetchClaudeUsage() {
     }
   });
 
-  if (!res.ok) {
-    if (res.status === 401) {
-      saveToken({ accessToken: null, expiresAt: 0, disabled: true });
-      throw new Error('Session expired — please login again.');
-    }
-    throw new Error(`Claude API ${res.status}`);
+  if (res.status === 401) {
+    // Token expired — clear it so next poll re-reads from CLI credentials
+    saveStoredToken({ accessToken: null, expiresAt: 0 });
+    throw new Error('Session expired — retry Login.');
   }
-  return await res.json();
+  if (!res.ok) throw new Error(`API ${res.status}`);
+
+  const data = await res.json();
+  return parseOAuthData(data);
 }
 
-// ── CLI Login ─────────────────────────────────────────────────────────────────
-// Runs `claude auth login --claudeai` which prints the OAuth URL to stdout.
-// The CLI opens the browser automatically — we just need to capture the URL
-// so we know the auth started. After the user approves in browser, the CLI
-// writes the token to ~/.claude/.credentials.json automatically.
-function runClaudeLogin() {
-  return new Promise((resolve, reject) => {
-    const child = spawn('claude', ['auth', 'login', '--claudeai'], {
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
+function parseOAuthData(data) {
+  const fiveHour = data.five_hour || {};
+  const sevenDay = data.seven_day || {};
+  const extra    = data.extra_usage || {};
 
-    let stdout = '';
-    let stderr = '';
+  return {
+    source: 'oauth',
+    session: {
+      utilization: fiveHour.utilization ?? null,
+      resetsAt: fiveHour.resets_at ?? null
+    },
+    weekly: {
+      utilization: sevenDay.utilization ?? null,
+      resetsAt: sevenDay.resets_at ?? null
+    },
+    extra: {
+      used: extra.used_credits ?? null,
+      limit: extra.monthly_limit ? extra.monthly_limit / 1000 : null
+    }
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CLI Fallback — runs `claude /usage` and parses output
+// ═══════════════════════════════════════════════════════════════════════════════
+function runClaudeUsage() {
+  return new Promise((resolve) => {
+    // script -q /dev/null runs claude in a PTY without capturing input
+    // We capture stdout+stderr and parse the rendered /usage panel
+    const child = spawn('script', [
+      '-q', '/dev/null',
+      '/bin/bash', '-c',
+      'claude /usage 2>&1'
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+    let output = '';
     let settled = false;
 
     const settle = (result) => {
       if (settled) return;
       settled = true;
       child.kill();
-      clearTimeout(timeout);
+      clearTimeout(timer);
       resolve(result);
     };
 
-    // Timeout after 2 min — OAuth browser flow takes time
-    const timeout = setTimeout(() => {
-      // Even on timeout, if we got a URL, count it as success
-      const url = extractOAuthUrl(stdout + stderr);
-      if (url) resolve({ url, output: stdout + stderr });
-      else settle({ url: null, output: stdout + stderr });
-    }, 120000);
+    // Give it 30 seconds for the CLI to respond
+    const timer = setTimeout(() => settle({ error: 'timeout' }), 30000);
 
-    child.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
-
-    child.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
-
-    child.on('close', (code) => {
-      const url = extractOAuthUrl(stdout + stderr);
-      settle({ url, output: stdout + stderr, code });
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
+    child.stdout.on('data', d => { output += d.toString(); });
+    child.stderr.on('data', d => { output += d.toString(); });
+    child.on('close', () => settle({ output }));
+    child.on('error', e => settle({ error: e.message }));
   });
 }
 
-function extractOAuthUrl(text) {
-  // Match any URL that contains oauth/authorize or similar OAuth flow
-  const match = text.match(/https?:\/\/[^\s'"]+oauth[^\s'"]*/);
-  if (match) {
-    let url = match[0];
-    while (url.length && '.,;:!?)]\'">'.includes(url[url.length-1])) {
-      url = url.slice(0, -1);
-    }
-    return url;
+function parseUsageOutput(output) {
+  // Claude /usage renders something like:
+  //   Account: peter@...
+  //
+  //   Current session         48%         (resets in 4h 15m)
+  //   Current week            12%         (resets in 6d 21h)
+  //
+  //   Extra                   $1.44 / $200
+
+  if (!output || output.includes('not logged in') || output.includes('Auth required')) {
+    return { error: 'CLI not authenticated' };
   }
-  // Fall back to any claudecode URL
-  const fallback = text.match(/https?:\/\/[^\s'"]+claude[^\s'"]*/);
-  if (fallback) {
-    let url = fallback[0];
-    while (url.length && '.,;:!?)]\'">'.includes(url[url.length-1])) {
-      url = url.slice(0, -1);
-    }
-    return url;
+
+  const result = { source: 'cli', session: {}, weekly: {}, extra: {} };
+
+  // Parse session utilization: "Current session         48%"
+  const sessionMatch = output.match(/Current session\s+(\d+)%/);
+  if (sessionMatch) result.session.utilization = parseInt(sessionMatch[1], 10);
+
+  // Parse session reset: "(resets in 4h 15m)"
+  const sessionResetMatch = output.match(/Current session[^)]*\([^)]*resets in ([^)]+)\)/);
+  if (sessionResetMatch) result.session.resetsAtText = sessionResetMatch[1].trim();
+
+  // Parse weekly utilization: "Current week            12%"
+  const weeklyMatch = output.match(/Current week\s+(\d+)%/);
+  if (weeklyMatch) result.weekly.utilization = parseInt(weeklyMatch[1], 10);
+
+  // Parse weekly reset
+  const weeklyResetMatch = output.match(/Current week[^)]*\([^)]*resets in ([^)]+)\)/);
+  if (weeklyResetMatch) result.weekly.resetsAtText = weeklyResetMatch[1].trim();
+
+  // Parse Extra: "Extra                   $1.44 / $200"
+  const extraMatch = output.match(/Extra\s+\$?([\d.]+)\s*\/\s*\$?([\d.]+)/);
+  if (extraMatch) {
+    result.extra.used = parseFloat(extraMatch[1]);
+    result.extra.limit = parseFloat(extraMatch[2]);
   }
-  return null;
+
+  return result;
 }
 
-// ── State ────────────────────────────────────────────────────────────────────
-let tray = null;
-let pollTimer = null;
-let cachedUsage = null;
-let lastRefresh = null;
-let refreshError = null;
-let pollIntervalMs = 5 * 60 * 1000;
-let storeDisabled = loadDisabled();
-let loginChild = null;
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Pace Calculation
+// ═══════════════════════════════════════════════════════════════════════════════
+// Window durations
+const SESSION_WINDOW_MS  = 5 * 60 * 60 * 1000;   // 5 hours
+const WEEKLY_WINDOW_MS   = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-// ── Icon ─────────────────────────────────────────────────────────────────────
-function createIcon() {
-  return nativeImage.createFromPath(path.join(__dirname, 'icon.png'));
+function calcPace(utilization, resetsAtISO, windowMs) {
+  // utilization is % remaining (0 = empty, 100 = full)
+  // pace > 0 means on pace, < 0 means deficit, > threshold means reserve
+  if (utilization == null || resetsAtISO == null) return null;
+
+  const msUntilReset = new Date(resetsAtISO) - Date.now();
+  if (msUntilReset <= 0) {
+    // Already reset or about to reset
+    return { status: 'reset_imminent', label: 'Reset now' };
+  }
+
+  const windowElapsed = windowMs - msUntilReset;
+  if (windowElapsed <= 0) {
+    return { status: 'early', label: 'Starting' };
+  }
+
+  // % of window that has elapsed
+  const timeRatio = windowElapsed / windowMs; // 0..1
+  // % of budget consumed
+  const usageRatio = (100 - utilization) / 100; // 0..1
+
+  const paceRatio = usageRatio - timeRatio;
+  const pacePct = Math.round(Math.abs(paceRatio) * 100);
+
+  if (paceRatio > 0.03) {
+    // Burning faster than even consumption → deficit
+    const runsOutMs = msUntilReset * (utilization / (100 - utilization));
+    return {
+      status: 'deficit',
+      label: `Runs out in ${formatDuration(runsOutMs)}`,
+      pct: pacePct
+    };
+  } else if (paceRatio < -0.03) {
+    // Burning slower than even consumption → reserve
+    const headroomMs = msUntilReset * ((100 - utilization) / utilization);
+    return {
+      status: 'reserve',
+      label: `${pacePct}% reserve`,
+      pct: pacePct
+    };
+  } else {
+    return { status: 'on_pace', label: 'On pace' };
+  }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-function fmtPct(n) { return n != null ? `${Math.round(n)}%` : '—'; }
-function resetIn(iso) {
-  if (!iso) return '';
-  try {
-    const diffMs = new Date(iso) - Date.now();
-    if (diffMs <= 0) return ' (reset now)';
-    return ` (${Math.floor(diffMs / 3600000)}h ${Math.floor((diffMs % 3600000) / 60000)}m)`;
-  } catch { return ''; }
+function formatDuration(ms) {
+  if (ms <= 0) return 'now';
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  if (h > 24) return `${Math.floor(h/24)}d ${h%24}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  State
+// ═══════════════════════════════════════════════════════════════════════════════
+let tray            = null;
+let pollTimer       = null;
+let cachedData      = null;
+let lastRefresh     = null;
+let lastError       = null;
+let settingsWin     = null;
+
+let pollIntervalMs = loadSettings().pollIntervalMs || 5 * 60 * 1000;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Icon
+// ═══════════════════════════════════════════════════════════════════════════════
+function makeIcon(utilization, hasError) {
+  // Reads icon.png (18x18 PNG from disk)
+  const iconPath = path.join(__dirname, 'icon.png');
+  let img = nativeImage.createFromPath(iconPath);
+
+  if (img.isEmpty()) {
+    // Fallback: transparent 18x18
+    img = nativeImage.createEmpty();
+  }
+
+  // Dim the icon if there's an error (template image mode)
+  if (hasError) {
+    img = img.isTemplate ? img : img;
+  }
+
+  return img;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Menu Builder
+// ═══════════════════════════════════════════════════════════════════════════════
+function fmtPct(n) {
+  return n != null ? `${Math.round(n)}%` : '—';
+}
+
+function fmtReset(resetText) {
+  if (!resetText) return '';
+  return ` (resets ${resetText})`;
 }
 
 function buildMenu() {
-  const u = cachedUsage;
-  const hasToken = !!getClaudeToken();
+  const d     = cachedData;
+  const token = getClaudeToken();
+  const hasToken = !!token;
+  const settings = loadSettings();
 
-  const sessionPct = u?.five_hour?.utilization;
-  const weeklyPct = u?.seven_day?.utilization;
-  const sessionResets = u?.five_hour?.resets_at;
-  const weeklyResets = u?.seven_day?.resets_at;
-  const extraLimit = u?.extra_usage?.monthly_limit;
-  const extraUsed = u?.extra_usage?.used_credits;
+  // Pace
+  const sessionPace = calcPace(
+    d?.session?.utilization,
+    d?.session?.resetsAt,
+    SESSION_WINDOW_MS
+  );
+  const weeklyPace = calcPace(
+    d?.weekly?.utilization,
+    d?.weekly?.resetsAt,
+    WEEKLY_WINDOW_MS
+  );
 
-  return Menu.buildFromTemplate([
+  // Build session row
+  let sessionLabel = `Session   ${fmtPct(d?.session?.utilization)}`;
+  if (sessionPace) {
+    const emoji = sessionPace.status === 'deficit' ? '⚠️ ' :
+                  sessionPace.status === 'reserve' ? '📦 ' :
+                  sessionPace.status === 'reset_imminent' ? '🔄 ' : '';
+    sessionLabel += ` ${emoji}${sessionPace.label}`;
+  }
+
+  // Build weekly row
+  let weeklyLabel = `Weekly    ${fmtPct(d?.weekly?.utilization)}`;
+  if (weeklyPace) {
+    const emoji = weeklyPace.status === 'deficit' ? '⚠️ ' :
+                  weeklyPace.status === 'reserve' ? '📦 ' :
+                  weeklyPace.status === 'reset_imminent' ? '🔄 ' : '';
+    weeklyLabel += ` ${emoji}${weeklyPace.label}`;
+  }
+
+  const extraUsed  = d?.extra?.used;
+  const extraLimit = d?.extra?.limit;
+  const extraRow = (extraUsed != null && extraLimit)
+    ? `Extra     $${extraUsed.toFixed(2)} / $${extraLimit}${extraUsed >= extraLimit ? ' ⚠️' : ''}`
+    : null;
+
+  const sourceTag = d?.source ? ` (${d.source})` : '';
+
+  const menu = Menu.buildFromTemplate([
     { label: '⚡  ClaudeBar', enabled: false },
     { type: 'separator' },
+
     ...(hasToken ? [
-      { label: `Session   ${fmtPct(sessionPct)}${resetIn(sessionResets)}`, enabled: false },
-      { label: `Weekly    ${fmtPct(weeklyPct)}${resetIn(weeklyResets)}`, enabled: false },
-      ...(extraLimit ? [{ label: `Extra     $${(extraUsed || 0).toFixed(2)} of $${extraLimit/1000}${extraUsed >= extraLimit ? ' ⚠️' : ''}`, enabled: false }] : []),
+      { label: sessionLabel, enabled: false },
+      { label: weeklyLabel, enabled: false },
+      ...(extraRow ? [{ label: extraRow, enabled: false }] : []),
       { type: 'separator' },
     ] : [
       { label: '⚠️  Not logged in', enabled: false },
       { type: 'separator' },
     ]),
-    ...(refreshError ? [{ label: `⚠️ ${refreshError.slice(0, 50)}`, enabled: false }] : []),
-    { label: `Refreshed ${lastRefresh || 'never'}`, enabled: false },
+
+    ...(lastError ? [{ label: `⚠️ ${lastError.slice(0, 60)}`, enabled: false }] : []),
+    { label: `Refreshed ${lastRefresh || 'never'}${sourceTag}`, enabled: false },
     { type: 'separator' },
-    { label: 'Login', click: handleLogin },
-    ...(hasToken ? [{ label: 'Logout', click: logout }] : []),
+
+    { label: 'Refresh Now', click: doRefresh },
+    { label: 'Settings',    click: openSettings },
+    ...(hasToken ? [{ label: 'Logout', click: logout }] : [{ label: 'Login', click: handleLogin }]),
     { type: 'separator' },
     { label: 'Quit', click: () => app.quit() }
   ]);
+
+  return menu;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Tray Setup
+// ═══════════════════════════════════════════════════════════════════════════════
 function createTray() {
-  tray = new Tray(createIcon());
+  tray = new Tray(makeIcon());
   tray.setToolTip('ClaudeBar');
-  refreshTray();
+  tray.setContextMenu(buildMenu());
   startPolling();
 }
 
 function refreshTray() {
   if (!tray) return;
-  const u = cachedUsage;
-  const hasToken = !!getClaudeToken();
-  tray.setToolTip(hasToken ? `ClaudeBar — Session ${fmtPct(u?.five_hour?.utilization)}` : 'ClaudeBar — Not logged in');
+  const pct = cachedData?.session?.utilization;
+  const tip = lastError
+    ? `⚠️ ${lastError.slice(0, 40)}`
+    : (pct != null ? `ClaudeBar — ${Math.round(pct)}%` : 'ClaudeBar');
+  tray.setToolTip(tip);
   tray.setContextMenu(buildMenu());
 }
 
-// ── Login Handler ─────────────────────────────────────────────────────────────
-async function handleLogin() {
-  refreshError = 'Opening browser...';
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Refresh Logic — OAuth → CLI fallback
+// ═══════════════════════════════════════════════════════════════════════════════
+async function doRefresh() {
+  lastError = null;
+
+  // 1. Try OAuth API
+  try {
+    cachedData = await fetchUsageOAuth();
+    lastRefresh = new Date().toLocaleTimeString();
+    lastError = null;
+  } catch (e) {
+    const oauthFailed = e.message;
+
+    // 2. Fall back to CLI /usage
+    try {
+      const { output, error } = await runClaudeUsage();
+      if (output && !error) {
+        const parsed = parseUsageOutput(output);
+        if (!parsed.error) {
+          cachedData = parsed;
+          lastRefresh = new Date().toLocaleTimeString();
+          lastError = null;
+        } else {
+          throw new Error(parsed.error);
+        }
+      } else {
+        throw new Error(error || 'CLI timed out');
+      }
+    } catch (cliErr) {
+      cachedData = null;
+      lastRefresh = new Date().toLocaleTimeString();
+      lastError = `${oauthFailed} / ${cliErr.message}`;
+    }
+  }
+
+  refreshTray();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Login — spawns `claude auth login --claudeai`
+// ═══════════════════════════════════════════════════════════════════════════════
+function handleLogin() {
+  lastError = 'Opening browser for login...';
   refreshTray();
 
-  try {
-    const child = spawn('claude', ['auth', 'login', '--claudeai'], {
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    loginChild = child;
-    let stderr = '';
+  const child = spawn('claude', ['auth', 'login', '--claudeai'], {
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
 
-    child.stderr.on('data', (data) => { stderr += data.toString(); });
+  let stderr = '';
+  child.stderr.on('data', d => { stderr += d.toString(); });
 
-    child.on('close', (code) => {
-      loginChild = null;
-      // OAuth flow completed — token should now be in ~/.claude/.credentials.json
-      storeDisabled = false;
-      setTimeout(doRefresh, 1000);
-    });
+  child.on('close', () => {
+    // CLI auth flow complete — token written to ~/.claude/.credentials.json
+    setTimeout(doRefresh, 2000);
+  });
 
-    child.on('error', (e) => {
-      loginChild = null;
-      if (e.code === 'ENOENT') {
-        refreshError = 'Claude CLI not found. Run: brew install anthropic';
-      } else {
-        refreshError = e.message;
-      }
-      refreshTray();
-    });
-
-  } catch (e) {
-    if (e.code === 'ENOENT' || e.message.includes('not found')) {
-      refreshError = 'Claude CLI not found. Run: brew install anthropic';
-    } else {
-      refreshError = e.message;
-    }
+  child.on('error', (e) => {
+    lastError = e.code === 'ENOENT'
+      ? 'Claude CLI not found. Run: brew install anthropic'
+      : e.message;
     refreshTray();
-  }
+  });
 }
 
 function logout() {
-  saveToken({ accessToken: null, expiresAt: 0, disabled: true });
-  storeDisabled = true;
-  cachedUsage = null;
-  refreshError = null;
+  saveStoredToken({ accessToken: null, expiresAt: 0, disabled: true });
+  cachedData = null;
+  lastError = null;
   refreshTray();
 }
 
-// ── Polling ──────────────────────────────────────────────────────────────────
-async function doRefresh() {
-  try {
-    cachedUsage = await fetchClaudeUsage();
-    lastRefresh = new Date().toLocaleTimeString();
-    refreshError = null;
-  } catch (e) {
-    refreshError = e.message;
-  }
-  refreshTray();
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Settings Window
+// ═══════════════════════════════════════════════════════════════════════════════
+function openSettings() {
+  if (settingsWin) { settingsWin.focus(); return; }
+
+  const preload = path.join(__dirname, 'preload.js');
+  settingsWin = new BrowserWindow({
+    width: 360, height: 240, resizable: false,
+    title: 'ClaudeBar Settings',
+    backgroundColor: '#1e1e1e',
+    webPreferences: { preload, contextIsolation: true, nodeIntegration: false }
+  });
+  settingsWin.loadFile(path.join(__dirname, 'settings.html'));
+  settingsWin.setMenu(null);
+  settingsWin.on('closed', () => { settingsWin = null; });
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  IPC
+// ═══════════════════════════════════════════════════════════════════════════════
+ipcMain.handle('get-settings', () => loadSettings());
+ipcMain.handle('save-settings', (_, s) => {
+  saveSettings(s);
+  pollIntervalMs = s.pollIntervalMs || 5 * 60 * 1000;
+  startPolling();
+  return loadSettings();
+});
+ipcMain.handle('get-data', () => ({ cachedData, lastRefresh, lastError }));
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Polling
+// ═══════════════════════════════════════════════════════════════════════════════
 function startPolling() {
-  doRefresh();
   if (pollTimer) clearInterval(pollTimer);
+  doRefresh();
   pollTimer = setInterval(doRefresh, pollIntervalMs);
 }
 
-// ── Bootstrap ────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Bootstrap
+// ═══════════════════════════════════════════════════════════════════════════════
 app.whenReady().then(() => { createTray(); });
 app.on('window-all-closed', () => { /* stay in tray */ });
 app.on('activate', () => { /* macOS dock */ });
