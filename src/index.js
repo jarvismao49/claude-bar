@@ -186,12 +186,11 @@ const WEEKLY_WINDOW_MS   = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 function calcPace(utilization, resetsAtISO, windowMs) {
   // utilization is % remaining (0 = empty, 100 = full)
-  // pace > 0 means on pace, < 0 means deficit, > threshold means reserve
+  // positive paceRatio = deficit (burning fast), negative = reserve (burning slow)
   if (utilization == null || resetsAtISO == null) return null;
 
   const msUntilReset = new Date(resetsAtISO) - Date.now();
   if (msUntilReset <= 0) {
-    // Already reset or about to reset
     return { status: 'reset_imminent', label: 'Reset now' };
   }
 
@@ -201,9 +200,20 @@ function calcPace(utilization, resetsAtISO, windowMs) {
   }
 
   // % of window that has elapsed
-  const timeRatio = windowElapsed / windowMs; // 0..1
+  const timeRatio = Math.min(windowElapsed / windowMs, 1.05); // cap at 1.05 to handle clock skew
   // % of budget consumed
-  const usageRatio = (100 - utilization) / 100; // 0..1
+  const usageRatio = (100 - utilization) / 100; // 0..1 (1 = fully consumed)
+
+  // At 100% utilization with most of the window elapsed → critical deficit
+  // e.g. 100% used with 4 min left in a 5h window = almost out of time
+  if (utilization >= 99 && timeRatio >= 0.9) {
+    const runsOutMs = utilization >= 100 ? 0 : msUntilReset * (utilization / (100 - utilization));
+    return {
+      status: 'deficit',
+      label: utilization >= 100 ? 'Out of time!' : `Runs out in ${formatDuration(runsOutMs)}`,
+      pct: Math.round((timeRatio - usageRatio) * 100)
+    };
+  }
 
   const paceRatio = usageRatio - timeRatio;
   const pacePct = Math.round(Math.abs(paceRatio) * 100);
@@ -447,23 +457,18 @@ function buildMenu() {
     WEEKLY_WINDOW_MS
   );
 
-  // Build session row
-  let sessionLabel = `Session   ${fmtPct(d?.session?.utilization)}`;
-  if (sessionPace) {
-    const emoji = sessionPace.status === 'deficit' ? '⚠️ ' :
-                  sessionPace.status === 'reserve' ? '📦 ' :
-                  sessionPace.status === 'reset_imminent' ? '🔄 ' : '';
-    sessionLabel += ` ${emoji}${sessionPace.label}`;
-  }
+  // Build session row — plain percentage, pace shown separately as warning if needed
+  const sessionLabel = `Session   ${fmtPct(d?.session?.utilization)}`;
 
   // Build weekly row
-  let weeklyLabel = `Weekly    ${fmtPct(d?.weekly?.utilization)}`;
-  if (weeklyPace) {
-    const emoji = weeklyPace.status === 'deficit' ? '⚠️ ' :
-                  weeklyPace.status === 'reserve' ? '📦 ' :
-                  weeklyPace.status === 'reset_imminent' ? '🔄 ' : '';
-    weeklyLabel += ` ${emoji}${weeklyPace.label}`;
-  }
+  const weeklyLabel = `Weekly    ${fmtPct(d?.weekly?.utilization)}`;
+
+  // Dedicated pace warning row — only shown when burning fast or out of time
+  const sessionPaceWarning = (sessionPace && sessionPace.status === 'deficit')
+    ? `⚠️ ${sessionPace.label}`
+    : (sessionPace && sessionPace.status === 'reset_imminent')
+    ? `🔄 ${sessionPace.label}`
+    : null;
 
   const extraUsed  = d?.extra?.used;
   const extraLimit = d?.extra?.limit;
@@ -480,8 +485,9 @@ function buildMenu() {
     ...(hasToken ? [
       { label: sessionLabel, enabled: false },
       { label: weeklyLabel, enabled: false },
+      ...(sessionPaceWarning ? [{ label: sessionPaceWarning, enabled: false }] : []),
       ...(extraRow ? [{ label: extraRow, enabled: false }] : []),
-    ...(cachedData?.localCosts ? [
+    ...(cachedData?.localCosts?.sessionCount > 0 ? [
       { label: `Local     ${fmtTokenCount(cachedData.localCosts.totalTokens)} tokens (${cachedData.localCosts.sessionCount} sessions)`, enabled: false }
     ] : []),
       { type: 'separator' },
