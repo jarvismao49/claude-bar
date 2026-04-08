@@ -5,5 +5,6 @@ contextBridge.exposeInMainWorld('api', {
   getData: () => ipcRenderer.invoke('get-data'),
   getLocalCosts: () => ipcRenderer.invoke('get-local-costs'),
   rescanLocalCosts: () => ipcRenderer.invoke('rescan-local-costs'),
-  getHistory: () => ipcRenderer.invoke('get-history')
+  getHistory: () => ipcRenderer.invoke('get-history'),
+  saveToken: (data) => ipcRenderer.invoke('save-token', data)
 });

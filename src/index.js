@@ -30,54 +30,124 @@ function saveStoredToken(t) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Claude Token — reads from CLI credentials (like CodexBar)
-//  This is the primary source: the CLI handles OAuth refresh internally.
+//  Claude Token — reads from user-provided token stored in config
+//  Supports two token types:
+//   - API key (sk-ant-api03-...) → api.anthropic.com with x-api-key header
+//   - Bearer token (sk-ant-oat01-... or other) → claude.ai/api/oauth/usage
 // ═══════════════════════════════════════════════════════════════════════════════
-const CLI_CRED_FILE = path.join(process.env.HOME, '.claude', '.credentials.json');
-
-function getClaudeToken() {
+function getToken() {
   const stored = loadStoredToken();
-  if (stored?.accessToken && stored?.expiresAt > Date.now()) {
-    return stored.accessToken;
-  }
-  // Always read fresh from CLI credentials file
-  try {
-    const cred = JSON.parse(fs.readFileSync(CLI_CRED_FILE, 'utf8'));
-    const token = cred?.claudeAiOauth?.accessToken;
-    if (token) {
-      // Refresh stored copy
-      if (stored?.accessToken !== token) {
-        saveStoredToken({ accessToken: token, expiresAt: Date.now() + 30 * 60 * 1000 });
-      }
-      return token;
-    }
-  } catch {}
-  return null;
+  if (!stored?.accessToken) return null;
+  if (stored.expiresAt > 0 && stored.expiresAt < Date.now()) return null; // expired
+  return stored;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Usage API — primary data source via OAuth
+//  Usage API — tries API key first, then Bearer token
 // ═══════════════════════════════════════════════════════════════════════════════
 async function fetchUsageOAuth() {
-  const token = getClaudeToken();
-  if (!token) throw new Error('Not logged in — run Login.');
+  const tokenData = getToken();
+  if (!tokenData) throw new Error('Not logged in — click Login.');
 
-  const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'anthropic-beta': 'oauth-2025-04-20'
-    }
-  });
+  const token = tokenData.accessToken;
+  const tokenType = tokenData.tokenType || 'api_key'; // 'api_key' | 'bearer'
 
-  if (res.status === 401) {
-    // Token expired — clear it so next poll re-reads from CLI credentials
-    saveStoredToken({ accessToken: null, expiresAt: 0 });
-    throw new Error('Session expired — retry Login.');
+  // Try API key endpoints first (api.anthropic.com)
+  if (token.startsWith('sk-ant-api')) {
+    const data = await fetchWithApiKey(token);
+    if (data) return data;
   }
-  if (!res.ok) throw new Error(`API ${res.status}`);
 
-  const data = await res.json();
-  return parseOAuthData(data);
+  // Try Bearer token endpoints (claude.ai web API)
+  const data = await fetchWithBearer(token);
+  if (data) return data;
+
+  throw new Error('Token may be invalid — try Login again.');
+}
+
+async function fetchWithApiKey(apiKey) {
+  // Try org-level subscription endpoint
+  const orgId = 'ed5bb49d-d040-47de-9a95-6ae47a3ecd28';
+  const endpoints = [
+    `https://api.anthropic.com/v1/organizations/${orgId}/subscription`,
+    'https://api.anthropic.com/v1/billing/credit_summary',
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01'
+        }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        // Parse different response formats into normalized shape
+        return parseApiResponse(data);
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function parseApiResponse(data) {
+  // Handle Anthropic API response shapes
+  // { plan: { name, interval }, included_messages: {...}, ... }
+  // or { subscription: {...}, usage: {...} }
+  if (!data) return null;
+
+  // If the response has a subscription object with limits
+  const sub = data.subscription || data.plan || data;
+
+  // Try to find message limits
+  const limits = sub.included_messages || sub.message_limits || sub.limits || {};
+
+  // Normalize into session (5h) and weekly buckets
+  return {
+    source: 'api_key',
+    session: {
+      utilization: limits.five_hour?.intervals?.used !== undefined
+        ? Math.round((limits.five_hour.intervals.used / limits.five_hour.intervals.limit) * 100)
+        : null,
+      resetsAt: limits.five_hour?.resets_at || null
+    },
+    weekly: {
+      utilization: limits.seven_day?.intervals?.used !== undefined
+        ? Math.round((limits.seven_day.intervals.used / limits.seven_day.intervals.limit) * 100)
+        : null,
+      resetsAt: limits.seven_day?.resets_at || null
+    },
+    extra: {
+      used: data.used_credits || data.credits_used || null,
+      limit: data.monthly_limit || data.credit_limit ? (data.monthly_limit || data.credit_limit) / 1000 : null
+    }
+  };
+}
+
+async function fetchWithBearer(bearerToken) {
+  // Try claude.ai web API endpoint
+  const endpoints = [
+    'https://claude.ai/api/oauth/usage',
+    'https://claude.ai/api/usage',
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${bearerToken}`,
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        return parseOAuthData(data);
+      }
+    } catch {}
+  }
+  return null;
 }
 
 function parseOAuthData(data) {
@@ -440,9 +510,9 @@ function fmtReset(resetText) {
 }
 
 function buildMenu() {
-  const d     = cachedData;
-  const token = getClaudeToken();
-  const hasToken = !!token;
+  const d        = cachedData;
+  const tokenData = getToken();
+  const hasToken = !!tokenData;
   const settings = loadSettings();
 
   // Pace
@@ -588,27 +658,9 @@ async function doRefresh() {
 //  Login — spawns `claude auth login --claudeai`
 // ═══════════════════════════════════════════════════════════════════════════════
 function handleLogin() {
-  lastError = 'Opening browser for login...';
-  refreshTray();
-
-  const child = spawn('claude', ['auth', 'login', '--claudeai'], {
-    stdio: ['pipe', 'pipe', 'pipe']
-  });
-
-  let stderr = '';
-  child.stderr.on('data', d => { stderr += d.toString(); });
-
-  child.on('close', () => {
-    // CLI auth flow complete — token written to ~/.claude/.credentials.json
-    setTimeout(doRefresh, 2000);
-  });
-
-  child.on('error', (e) => {
-    lastError = e.code === 'ENOENT'
-      ? 'Claude CLI not found. Run: brew install anthropic'
-      : e.message;
-    refreshTray();
-  });
+  // Open browser to claude.ai for login (also opens the login window)
+  require('electron').shell.openExternal('https://claude.ai');
+  openLoginWindow();
 }
 
 function logout() {
@@ -621,6 +673,22 @@ function logout() {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Settings Window
 // ═══════════════════════════════════════════════════════════════════════════════
+let loginWin = null;
+
+function openLoginWindow() {
+  if (loginWin) { loginWin.focus(); return; }
+  const preload = path.join(__dirname, 'preload.js');
+  loginWin = new BrowserWindow({
+    width: 420, height: 520, resizable: false,
+    title: 'ClaudeBar Login',
+    backgroundColor: '#1e1e1e',
+    webPreferences: { preload, contextIsolation: true, nodeIntegration: false }
+  });
+  loginWin.loadFile(path.join(__dirname, 'login.html'));
+  loginWin.setMenu(null);
+  loginWin.on('closed', () => { loginWin = null; });
+}
+
 function openSettings() {
   if (settingsWin) { settingsWin.focus(); return; }
 
@@ -666,6 +734,17 @@ ipcMain.handle('rescan-local-costs', () => {
   return costs;
 });
 ipcMain.handle('get-history', () => loadHistory());
+ipcMain.handle('save-token', (_, { token, tokenType }) => {
+  // Token type: 'api_key' or 'bearer'
+  saveStoredToken({
+    accessToken: token,
+    tokenType: tokenType || 'api_key',
+    expiresAt: 0 // never expires automatically — user re-enters when needed
+  });
+  if (loginWin) { loginWin.close(); loginWin = null; }
+  setTimeout(doRefresh, 1000);
+  return true;
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Polling

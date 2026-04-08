@@ -61,38 +61,65 @@
 <body>
   <h2>⚡ Login to Claude</h2>
 
-  <p class="browser-note">A browser window should have opened to claude.ai/login. Log in there first, then:</p>
+  <p style="color: #aaa; margin-bottom: 12px;">Two ways to get a token — try Option 1 first:</p>
 
-  <ol>
-    <li>Open DevTools in the browser: <strong>F12</strong> (or right-click → Inspect)</li>
-    <li>Go to the <strong>Network</strong> tab</li>
-    <li>Filter by: <code>api/oauth/usage</code></li>
-    <li>Look at the <strong>Request Headers</strong> — copy the full <code>Bearer &lt;token&gt;</code> value</li>
-    <li>Paste it below</li>
-  </ol>
+  <div style="background: #252525; border-radius: 8px; padding: 14px; margin-bottom: 12px;">
+    <div style="color: #f0c040; font-weight: 600; margin-bottom: 8px;">Option 1 — API Key (easiest)</div>
+    <ol style="color: #aaa; padding-left: 18px;">
+      <li>Go to <a href="https://console.anthropic.com" style="color: #6ab5f0;" onclick="require('electron').shell.openExternal(this.href)">console.anthropic.com</a> → API Keys</li>
+      <li>Create a new key or use an existing one</li>
+      <li>Copy and paste it below</li>
+    </ol>
+  </div>
 
-  <input type="text" id="token" placeholder="sk-ant-oat01-...">
-  <div class="hint">Get your Bearer token from the Network tab → Request Headers</div>
+  <div style="background: #252525; border-radius: 8px; padding: 14px; margin-bottom: 12px;">
+    <div style="color: #f0c040; font-weight: 600; margin-bottom: 8px;">Option 2 — Browser Bearer Token</div>
+    <ol style="color: #aaa; padding-left: 18px;">
+      <li>Open <a href="https://claude.ai" style="color: #6ab5f0;" onclick="require('electron').shell.openExternal(this.href)">claude.ai</a> and log in</li>
+      <li>Open DevTools: <strong>F12</strong> → Network tab</li>
+      <li>Filter by <code>api/oauth/usage</code> and refresh the page</li>
+      <li>Copy the <code>Bearer &lt;token&gt;</code> value from Request Headers</li>
+      <li>Paste it below</li>
+    </ol>
+  </div>
 
-  <button class="btn" onclick="submit()">Save & Connect</button>
+  <input type="text" id="token" placeholder="sk-ant-api03-... or sk-ant-oat01-...">
+  <div class="hint" id="hint">Paste your API key or Bearer token here</div>
+
+  <button class="btn" id="submitBtn" onclick="submit()">Save & Connect</button>
   <div class="msg" id="msg"></div>
 
   <script>
     function submit() {
       const val = document.getElementById('token').value.trim();
-      if (!val.startsWith('sk-ant-oat')) {
-        document.getElementById('msg').className = 'msg err';
-        document.getElementById('msg').textContent = 'Token should start with sk-ant-oat...';
+      const btn = document.getElementById('submitBtn');
+      const msg = document.getElementById('msg');
+
+      if (!val.startsWith('sk-ant-')) {
+        msg.className = 'msg err';
+        msg.textContent = 'Invalid token format — must start with sk-ant-';
         return;
       }
-      // Token is valid format — save it (expires in 30 days)
-      const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000;
-      window.api.saveToken({ accessToken: val, expiresAt });
-      document.getElementById('msg').className = 'msg ok';
-      document.getElementById('msg').textContent = 'Saved!';
-      setTimeout(() => window.close(), 800);
+
+      // Determine token type
+      const tokenType = val.startsWith('sk-ant-api') ? 'api_key' : 'bearer';
+
+      btn.disabled = true;
+      btn.textContent = 'Connecting...';
+      msg.className = 'msg';
+      msg.textContent = 'Testing token...';
+
+      window.api.saveToken({ token: val, tokenType }).then(() => {
+        msg.className = 'msg ok';
+        msg.textContent = 'Connected! Closing...';
+        setTimeout(() => window.close(), 800);
+      }).catch(err => {
+        btn.disabled = false;
+        btn.textContent = 'Save & Connect';
+        msg.className = 'msg err';
+        msg.textContent = 'Error: ' + (err.message || 'connection failed');
+      });
     }
-    // Listen for the IPC message via the injected api
     document.getElementById('token').focus();
   </script>
 </body>
