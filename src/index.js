@@ -1,5 +1,5 @@
 'use strict';
-const { app, Tray, Menu, nativeImage, ipcMain, globalShortcut } = require('electron');
+const { app, Tray, Menu, nativeImage, ipcMain, globalShortcut, BrowserWindow } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
